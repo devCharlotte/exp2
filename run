@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+# run
+# usage:
+#   sudo ./run on  best 64 4 [--dur=2] [--pts=15000] [--slp=10] [--gov=performance] [--pin-ksmd]
+#   sudo ./run off best 64 4 [동일]
+# 특징:
+#  - 매 실행 시 UNMERGE + THP/NUMA/zero-pages 고정(use_zero_pages=0)
+#  - 모든 자식에 동일 KSM_TAG 제공 → 우리 workload끼리만 병합
+#  - PSS 기반 Saved_self_pss(MB) 계산(핵심 지표)
+#  - 전역 KSM 카운터 샘플링을 CSV로 저장
+
+set -Eeuo pipefail
+trap 'echo "[ERROR] line $LINENO status=$?" >&2' ERR
+
+# 기본값
+DUR=10
+PTS=50000
+SLP=5
+GOV=""
+PIN_KSMD=0
+
+# 위치 인자
+KSM_SWITCH=${1:?on|off}
+MODE=${2:?best|worst}
+MB=${3:?size_mb}
+N=${4:?nproc}
+shift 4 || true
+
+# 플래그 파싱
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dur=*) DUR="${1#*=}" ;;
+    --pts=*) PTS="${1#*=}" ;;
+    --slp=*|--sleep-ms=*) SLP="${1#*=}" ;;
+    --gov=*) GOV="${1#*=}" ;;
+    --pin-ksmd) PIN_KSMD=1 ;;
+    *) echo "unknown option: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+[ "$EUID" -eq 0 ] || { echo "sudo로 실행하세요" >&2; exit 1; }
+[ -x ./wl ] || { echo "./wl 없음. 먼저 'make' 실행" >&2; exit 1; }
+
+KSMDIR=/sys/kernel/mm/ksm
+need=(run pages_to_scan sleep_millisecs pages_shared pages_sharing full_scans)
+for f in "${need[@]}"; do
+  [ -e "$KSMDIR/$f" ] || { echo "KSM sysfs 누락: $KSMDIR/$f" >&2; exit 1; }
+done
+
+# ---- 환경 고정 ----
+# CPU governor(선택)
+if [[ -n "$GOV" ]]; then
+  for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do echo "$GOV" > "$g" 2>/dev/null || true; done
+fi
+# THP/NUMA/zero-pages
+echo never > /sys/kernel/mm/transparent_hugepage/enabled || true
+echo 0     > /proc/sys/kernel/numa_balancing              || true
+[[ -e "$KSMDIR/use_zero_pages" ]] && echo 0 > "$KSMDIR/use_zero_pages" || true
+# UNMERGE
+echo 0 > "$KSMDIR/run"; echo 2 > "$KSMDIR/run"; echo 0 > "$KSMDIR/run"
+
+# KSM 튜너블
+echo 0        > "$KSMDIR/run"
+echo "$PTS"   > "$KSMDIR/pages_to_scan"
+echo "$SLP"   > "$KSMDIR/sleep_millisecs"
+
+# 전역 스냅샷(참고)
+PS0=$(cat "$KSMDIR/pages_shared"); PSG0=$(cat "$KSMDIR/pages_sharing"); FS0=$(cat "$KSMDIR/full_scans")
+
+# ---- 워크로드 기동 (동일 태그로 외부 충돌 차단) ----
+TAG=$(printf "%016x" $(( ($(date +%s%N) ^ $$ ^ RANDOM) & 0xFFFFFFFFFFFFFFFF )))
+pids=()
+for i in $(seq 1 "$N"); do
+  KSM_TAG="$TAG" ./wl "$MODE" "$MB" "$((DUR+5))" 2> "ready_${i}.log" &
+  pids+=($!)
+done
+
+# READY 동기화(최대 10초)
+for _ in $(seq 1 10); do
+  r=0; for i in $(seq 1 "$N"); do grep -q "READY pid=" "ready_${i}.log" && r=$((r+1)) || true; done
+  [[ $r -eq $N ]] && break
+  sleep 1
+done
+
+# 동일 시점 madvise
+for pid in "${pids[@]}"; do kill -USR1 "$pid"; done
+
+# PSS 읽기 함수
+pss_kb() { local pid=$1; if [[ -r /proc/$pid/smaps_rollup ]]; then awk '/^Pss:/ {print $2; exit}' /proc/$pid/smaps_rollup; else awk '/^Pss:/ {s+=$2} END{print s+0}' /proc/$pid/smaps; fi; }
+
+# baseline(PSS, KSM off)
+sleep 1
+self_pss0_kb=0; for pid in "${pids[@]}"; do self_pss0_kb=$(( self_pss0_kb + $(pss_kb "$pid" 2>/dev/null || echo 0) )); done
+
+# ksmd CPU tick 스냅샷
+KPID=$(pgrep -x ksmd || true); HZ=$(getconf CLK_TCK)
+read _ _ _ _ _ _ _ _ _ _ _ _ ut st _ < /proc/${KPID:-0}/stat 2>/dev/null || { ut=0; st=0; }
+pre_ticks=$((ut+st)); [[ "$PIN_KSMD" -eq 1 && -n "$KPID" ]] && taskset -p -c 0 "$KPID" >/dev/null 2>&1 || true
+
+# ---- CSV 준비(전역 카운터 시계열) ----
+TS=$(date +%Y%m%d_%H%M%S)
+CSV="ksm_${MODE}_ksm-${KSM_SWITCH}_dur-${DUR}_pts-${PTS}_slp-${SLP}_${TS}.csv"
+echo "t_sec,pages_shared,pages_sharing,full_scans,delta_shared,delta_sharing,delta_full_scans,saved_MB_delta" > "$CSV"
+
+# ---- KSM on/off phase + 시계열 수집 ----
+[[ "$KSM_SWITCH" = "on" ]] && echo 1 > "$KSMDIR/run"
+t0=$(date +%s)
+while :; do
+  now=$(date +%s); elapsed=$((now - t0)); [[ $elapsed -ge $DUR ]] && break
+  PS=$(cat "$KSMDIR/pages_shared"); PSG=$(cat "$KSMDIR/pages_sharing"); FS=$(cat "$KSMDIR/full_scans")
+  dPS=$((PS - PS0)); dPSG=$((PSG - PSG0)); dFS=$((FS - FS0)); saved_pages=$((dPSG - dPS)); saved_MB=$((saved_pages*4/1024))
+  echo "$elapsed,$PS,$PSG,$FS,$dPS,$dPSG,$dFS,$saved_MB" >> "$CSV"
+  sleep 1
+done
+
+# final PSS (프로세스 살아있을 때)
+self_pss1_kb=0; for pid in "${pids[@]}"; do self_pss1_kb=$(( self_pss1_kb + $(pss_kb "$pid" 2>/dev/null || echo 0) )); done
+
+# 종료/정리
+echo 0 > "$KSMDIR/run"
+for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || true; done
+wait 2>/dev/null || true
+
+# 전역 최종(참고)
+PS=$(cat "$KSMDIR/pages_shared"); PSG=$(cat "$KSMDIR/pages_sharing"); FS=$(cat "$KSMDIR/full_scans")
+dPS=$((PS - PS0)); dPSG=$((PSG - PSG0)); dFS=$((FS - FS0)); saved_pages=$((dPSG - dPS)); saved_MB=$((saved_pages*4/1024))
+echo "FINAL,$PS,$PSG,$FS,$dPS,$dPSG,$dFS,$saved_MB" >> "$CSV"
+
+# Self-only 절감(PSS)
+saved_self_mb=$(( (self_pss0_kb - self_pss1_kb)/1024 ))
+(( saved_self_mb < 0 )) && saved_self_mb=0
+
+# ksmd CPU-초(정규화 지표용)
+read _ _ _ _ _ _ _ _ _ _ _ _ ut st _ < /proc/${KPID:-0}/stat 2>/dev/null || { ut=0; st=0; }
+post_ticks=$((ut+st))
+cpu_sec=$(awk -v d="$((post_ticks-pre_ticks))" -v hz="$HZ" 'BEGIN{printf (hz>0?"%.3f":"0.000"), (hz>0?d/hz:0)}')
+mb_per_cpu_sec=$(awk -v m="$saved_self_mb" -v c="$cpu_sec" 'BEGIN{if(c>0) printf "%.3f", m/c; else print "INF";}')
+
+THEO_MAX=0; [[ "$MODE" = "best" ]] && THEO_MAX=$(( (N-1)*MB ))
+ach_self=0; [[ "$THEO_MAX" -gt 0 ]] && ach_self=$(( saved_self_mb*100/THEO_MAX ))
+
+# 요약
+echo "----- KSM RUN SUMMARY -----"
+echo "KSM            : $KSM_SWITCH"
+echo "Workload       : $MODE, MB/proc=$MB, N=$N"
+echo "Params         : dur=${DUR}s, pages_to_scan=${PTS}, sleep_ms=${SLP}"
+echo "Elapsed        : ${DUR}s"
+echo "Self PSS base  : $((self_pss0_kb/1024)) MB"
+echo "Self PSS final : $((self_pss1_kb/1024)) MB"
+echo "Saved_self_pss : ${saved_self_mb} MB   # <<< 비교 핵심 지표"
+echo "ksmd_cpu_sec   : ${cpu_sec} s"
+echo "MB_per_cpu_sec : ${mb_per_cpu_sec} MB/s"
+echo "Theo max (MB)  : ${THEO_MAX} MB"
+echo "Achieved_self  : ${ach_self}%"
+echo "----(참고: 전역 KSM 카운터)----"
+echo "Δshared        : ${dPS} pages"
+echo "Δsharing       : ${dPSG} pages"
+echo "Δfull_scans    : ${dFS}"
+echo "Saved (MB)     : ${saved_MB} MB (전역)"
+echo "CSV saved      : ${CSV}"
+echo "----------------------------"
